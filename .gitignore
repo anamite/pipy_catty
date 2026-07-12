@@ -12,6 +12,9 @@ __pycache__/
 install_log.txt
 *.log
 
+# pipy CLI runtime state (pid file, logs)
+.pipy/
+
 # Downloaded model artifacts (openWakeWord / VAD models fetch automatically)
 .models/
 *.onnx

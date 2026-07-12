@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Background process control for the pipy_catty voice bot.
+# Usage: ./pipy {start|stop|restart|status|logs [n]}
+set -uo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+STATE_DIR=".pipy"
+PID_FILE="$STATE_DIR/pipy.pid"
+LOG_FILE="$STATE_DIR/pipy.log"
+VENV_PY="venv/Scripts/python.exe"
+
+mkdir -p "$STATE_DIR"
+
+# Git Bash's `$!` is an MSYS PID, not a real Windows PID, so tasklist/taskkill
+# (which only understand Windows PIDs) can't see it directly. `ps -W` exposes
+# a WINPID column that maps MSYS PID -> Windows PID; we resolve and store that.
+resolve_winpid() {
+    local bash_pid="$1"
+    ps -W 2>/dev/null | awk -v p="$bash_pid" '$1==p {print $4}'
+}
+
+is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(cat "$PID_FILE")
+    [ -n "$pid" ] || return 1
+    MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "^python.exe"
+}
+
+cmd_start() {
+    if is_running; then
+        echo "pipy is already running (PID $(cat "$PID_FILE"))."
+        return 0
+    fi
+    if [ ! -f "$VENV_PY" ]; then
+        echo "Virtual environment not found. Run ./install.sh first." >&2
+        return 1
+    fi
+
+    echo "Starting pipy voice bot..."
+    "$VENV_PY" -u bot.py >>"$LOG_FILE" 2>&1 &
+    local bash_pid=$!
+    disown "$bash_pid" 2>/dev/null || true
+
+    # Give Windows a moment to register the child process before we look it up.
+    sleep 1
+    local win_pid
+    win_pid=$(resolve_winpid "$bash_pid")
+    if [ -z "$win_pid" ]; then
+        echo "pipy failed to start — check $LOG_FILE" >&2
+        return 1
+    fi
+    echo "$win_pid" >"$PID_FILE"
+
+    sleep 1
+    if is_running; then
+        echo "pipy started (PID $win_pid). Logs: $LOG_FILE"
+    else
+        echo "pipy exited immediately — check $LOG_FILE" >&2
+        tail -n 20 "$LOG_FILE" >&2 2>/dev/null
+        rm -f "$PID_FILE"
+        return 1
+    fi
+}
+
+cmd_stop() {
+    if ! is_running; then
+        echo "pipy is not running."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    local pid
+    pid=$(cat "$PID_FILE")
+    echo "Stopping pipy (PID $pid)..."
+    MSYS_NO_PATHCONV=1 taskkill /F /T /PID "$pid" >/dev/null 2>&1
+    rm -f "$PID_FILE"
+    echo "Stopped."
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    if is_running; then
+        echo "pipy: RUNNING (PID $(cat "$PID_FILE"))"
+        if [ -f "$LOG_FILE" ]; then
+            echo "--- last 10 log lines ---"
+            tail -n 10 "$LOG_FILE"
+        fi
+    else
+        echo "pipy: STOPPED"
+    fi
+}
+
+cmd_logs() {
+    touch "$LOG_FILE"
+    tail -n "${1:-50}" -f "$LOG_FILE"
+}
+
+case "${1:-}" in
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status) cmd_status ;;
+    logs) shift; cmd_logs "${1:-50}" ;;
+    *)
+        echo "Usage: ./pipy {start|stop|restart|status|logs [n]}"
+        exit 1
+        ;;
+esac
