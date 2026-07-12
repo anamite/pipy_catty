@@ -1,0 +1,5 @@
+pipecat-ai[speechmatics,openai,silero,local]
+python-dotenv
+openwakeword
+soxr
+httpx

@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Logs
+install_log.txt
+*.log
+
+# Downloaded model artifacts (openWakeWord / VAD models fetch automatically)
+.models/
+*.onnx
