@@ -28,6 +28,7 @@ already sent to (and billed by) the STT. Gating on raw audio here means nothing
 reaches Speechmatics until the wake word fires locally.
 """
 
+import argparse
 import asyncio
 import logging
 import os
@@ -330,6 +331,40 @@ async def poll_pending(
                 )
 
 
+def _env_int(name: str) -> int | None:
+    val = os.getenv(name, "").strip()
+    return int(val) if val else None
+
+
+def list_audio_devices():
+    """Print PyAudio device indices/names, e.g. to configure a Pi's mic/speaker."""
+    import pyaudio
+
+    pa = pyaudio.PyAudio()
+    try:
+        print(f"{'idx':>4}  {'in':>3} {'out':>3}  name")
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            print(
+                f"{i:>4}  {info['maxInputChannels']:>3} {info['maxOutputChannels']:>3}  "
+                f"{info['name']}"
+            )
+        try:
+            print(f"\nDefault input:  {pa.get_default_input_device_info()['name']}")
+        except OSError:
+            print("\nDefault input:  (none)")
+        try:
+            print(f"Default output: {pa.get_default_output_device_info()['name']}")
+        except OSError:
+            print("Default output: (none)")
+        print(
+            "\nSet AUDIO_INPUT_DEVICE_INDEX / AUDIO_OUTPUT_DEVICE_INDEX in .env "
+            "to override the default."
+        )
+    finally:
+        pa.terminate()
+
+
 async def main():
     openai_key = os.getenv("OPENAI_API_KEY")
     speechmatics_key = os.getenv("SPEECHMATICS_API_KEY")
@@ -353,8 +388,18 @@ async def main():
         lity_headers["Authorization"] = f"Bearer {lity_api_key}"
 
     # --- Transport: local mic + speakers (no VAD; Speechmatics endpoints) ------
+    # On boards with multiple audio devices (e.g. a Pi with HDMI + headphone
+    # jack + USB mic), the ALSA default is not always the one you want. Run
+    # `bot.py --list-devices` to see indices, then set these in .env.
+    input_device_index = _env_int("AUDIO_INPUT_DEVICE_INDEX")
+    output_device_index = _env_int("AUDIO_OUTPUT_DEVICE_INDEX")
     transport = LocalAudioTransport(
-        LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True)
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            input_device_index=input_device_index,
+            output_device_index=output_device_index,
+        )
     )
 
     # --- Wake-word gate + STT bridge ------------------------------------------
@@ -437,4 +482,15 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List audio input/output devices and exit (for configuring .env on new hardware).",
+    )
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_audio_devices()
+    else:
+        asyncio.run(main())

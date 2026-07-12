@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Background process control for the pipy_catty voice bot.
-# Usage: ./pipy {start|stop|restart|status|logs [n]}
+# Works on Raspberry Pi / Debian Linux (the deployment target) and on
+# Windows via Git Bash (for local dev).
+# Usage: ./pipy {start|stop|restart|status|logs [n]|devices}
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -8,24 +10,34 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 STATE_DIR=".pipy"
 PID_FILE="$STATE_DIR/pipy.pid"
 LOG_FILE="$STATE_DIR/pipy.log"
-VENV_PY="venv/Scripts/python.exe"
+OS_KIND="$(uname -s)"
+
+case "$OS_KIND" in
+    Linux)   VENV_PY="venv/bin/python" ;;
+    *)       VENV_PY="venv/Scripts/python.exe" ;;  # Git Bash on Windows
+esac
 
 mkdir -p "$STATE_DIR"
-
-# Git Bash's `$!` is an MSYS PID, not a real Windows PID, so tasklist/taskkill
-# (which only understand Windows PIDs) can't see it directly. `ps -W` exposes
-# a WINPID column that maps MSYS PID -> Windows PID; we resolve and store that.
-resolve_winpid() {
-    local bash_pid="$1"
-    ps -W 2>/dev/null | awk -v p="$bash_pid" '$1==p {print $4}'
-}
 
 is_running() {
     [ -f "$PID_FILE" ] || return 1
     local pid
     pid=$(cat "$PID_FILE")
     [ -n "$pid" ] || return 1
-    MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "^python.exe"
+    if [ "$OS_KIND" = "Linux" ]; then
+        kill -0 "$pid" 2>/dev/null
+    else
+        # Git Bash's `$!` is an MSYS PID, not a real Windows PID, so we store
+        # and check the real Windows PID (see cmd_start) via tasklist.
+        MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "^python.exe"
+    fi
+}
+
+# Resolves a Git Bash `$!` (MSYS PID) to the real Windows PID via `ps -W`'s
+# WINPID column. Not needed on Linux, where `$!` is already the real PID.
+resolve_winpid() {
+    local bash_pid="$1"
+    ps -W 2>/dev/null | awk -v p="$bash_pid" '$1==p {print $4}'
 }
 
 cmd_start() {
@@ -43,19 +55,22 @@ cmd_start() {
     local bash_pid=$!
     disown "$bash_pid" 2>/dev/null || true
 
-    # Give Windows a moment to register the child process before we look it up.
-    sleep 1
-    local win_pid
-    win_pid=$(resolve_winpid "$bash_pid")
-    if [ -z "$win_pid" ]; then
+    local pid
+    if [ "$OS_KIND" = "Linux" ]; then
+        pid="$bash_pid"
+    else
+        sleep 1  # give Windows a moment to register the child process
+        pid=$(resolve_winpid "$bash_pid")
+    fi
+    if [ -z "$pid" ]; then
         echo "pipy failed to start — check $LOG_FILE" >&2
         return 1
     fi
-    echo "$win_pid" >"$PID_FILE"
+    echo "$pid" >"$PID_FILE"
 
     sleep 1
     if is_running; then
-        echo "pipy started (PID $win_pid). Logs: $LOG_FILE"
+        echo "pipy started (PID $pid). Logs: $LOG_FILE"
     else
         echo "pipy exited immediately — check $LOG_FILE" >&2
         tail -n 20 "$LOG_FILE" >&2 2>/dev/null
@@ -73,7 +88,16 @@ cmd_stop() {
     local pid
     pid=$(cat "$PID_FILE")
     echo "Stopping pipy (PID $pid)..."
-    MSYS_NO_PATHCONV=1 taskkill /F /T /PID "$pid" >/dev/null 2>&1
+    if [ "$OS_KIND" = "Linux" ]; then
+        kill "$pid" 2>/dev/null
+        for _ in $(seq 1 10); do
+            is_running || break
+            sleep 0.5
+        done
+        is_running && kill -9 "$pid" 2>/dev/null  # still alive: force it
+    else
+        MSYS_NO_PATHCONV=1 taskkill /F /T /PID "$pid" >/dev/null 2>&1
+    fi
     rm -f "$PID_FILE"
     echo "Stopped."
 }
@@ -101,14 +125,23 @@ cmd_logs() {
     tail -n "${1:-50}" -f "$LOG_FILE"
 }
 
+cmd_devices() {
+    if [ ! -f "$VENV_PY" ]; then
+        echo "Virtual environment not found. Run ./install.sh first." >&2
+        return 1
+    fi
+    "$VENV_PY" bot.py --list-devices
+}
+
 case "${1:-}" in
     start) cmd_start ;;
     stop) cmd_stop ;;
     restart) cmd_restart ;;
     status) cmd_status ;;
     logs) shift; cmd_logs "${1:-50}" ;;
+    devices) cmd_devices ;;
     *)
-        echo "Usage: ./pipy {start|stop|restart|status|logs [n]}"
+        echo "Usage: ./pipy {start|stop|restart|status|logs [n]|devices}"
         exit 1
         ;;
 esac
