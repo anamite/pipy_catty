@@ -96,7 +96,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.llm import OpenAILLMService
 # from pipecat.services.openai.tts import OpenAITTSService
-from pipecat.services.kokoro import KokoroTTSService
+from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
