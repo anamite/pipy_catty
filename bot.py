@@ -13,13 +13,19 @@ Wake-word gating (see the state diagram this implements):
        ▼
     LISTENING   Mic audio is streamed to Speechmatics. A relock timer runs; if
                 you don't start speaking before it fires, we go back to LOCKED.
-       │  Speechmatics reports you finished a sentence (UserStoppedSpeaking)
+                End-of-turn is Speechmatics' ADAPTIVE detection with a generous
+                silence trigger (EOU_SILENCE_TRIGGER, default 1.5s), so pausing
+                to breathe mid-thought doesn't end your turn.
+       │  Speechmatics reports you finished your turn (UserStoppedSpeaking)
        ▼
-    PROCESSING  Mic is muted while the LLM thinks and the bot speaks. This is
-                also what stops the bot from hearing its own voice.
+    PROCESSING  Mic audio is replaced with silence while the LLM thinks and the
+                bot speaks (stops self-hearing, keeps the STT stream continuous
+                so leftover words flush out and get dropped). openWakeWord still
+                runs on the real mic: saying the wake word here interrupts the
+                bot mid-sentence (barge-in) and reopens the mic.
        │  bot finished speaking (BotStoppedSpeaking)
        ▼
-    LISTENING   Re-open the mic for `FOLLOWUP_SECONDS` (default 3s) so you can
+    LISTENING   Re-open the mic for `FOLLOWUP_SECONDS` (default 5s) so you can
                 reply without repeating the wake word. Silence -> LOCKED.
 
 Why a custom audio gate instead of pipecat's built-in WakeCheckFilter: that
@@ -33,6 +39,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 import warnings
 
 # Pipecat 1.5.0 soft-deprecates PipelineTask/PipelineRunner in favor of the
@@ -51,8 +58,11 @@ from openwakeword.model import Model as WakeWordModel
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ErrorFrame,
     Frame,
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
+    LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMTextFrame,
     TranscriptionFrame,
@@ -136,11 +146,20 @@ class WakeWordGate(FrameProcessor):
         self._state = "LOCKED"
         self._user_speaking = False
         self._relock_task: asyncio.Task | None = None
+        # Watchdog: if we enter PROCESSING but the bot never starts speaking
+        # (turn lost, LLM/backend down), relock instead of staying muted forever.
+        self._processing_watchdog: asyncio.Task | None = None
+        self._processing_timeout = float(os.getenv("PROCESSING_TIMEOUT_SECONDS", "30"))
 
     @property
     def is_idle(self) -> bool:
         """True only when locked (wake-word idle) — safe to poll for pushes."""
         return self._state == "LOCKED"
+
+    @property
+    def is_listening(self) -> bool:
+        """True when we're accepting user speech (mic → STT)."""
+        return self._state == "LISTENING"
 
     # ---- pipeline entry point -------------------------------------------------
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -155,8 +174,14 @@ class WakeWordGate(FrameProcessor):
         # use them to drive the state machine.
         if isinstance(frame, BotStartedSpeakingFrame):
             self._enter_processing()
+            # The bot is responding — the turn wasn't lost; stand down.
+            self._cancel_processing_watchdog()
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            await self._enter_listening(self._followup_seconds, "bot finished")
+            # Only transition on a natural end of speech; after a barge-in the
+            # gate is already LISTENING with the full wake window and the
+            # interrupted bot's trailing BotStopped must not shrink it.
+            if self._state == "PROCESSING":
+                await self._enter_listening(self._followup_seconds, "bot finished")
 
         await self.push_frame(frame, direction)
 
@@ -167,7 +192,26 @@ class WakeWordGate(FrameProcessor):
         elif self._state == "LOCKED":
             if self._detect_wakeword(frame):
                 await self._enter_listening(self._wake_listen_seconds, "wake word")
-        # PROCESSING: drop the frame (mic muted while bot responds).
+        elif self._state == "PROCESSING":
+            # Barge-in: openWakeWord keeps watching the real mic while the bot
+            # responds. Saying the wake word cuts the bot off and reopens the
+            # mic, so you can talk over it naturally.
+            if self._detect_wakeword(frame):
+                logger.info("🙋 Wake word during bot response — interrupting")
+                await self.broadcast_interruption()
+                await self._enter_listening(self._wake_listen_seconds, "barge-in")
+                return
+            # Otherwise the mic stays muted, but keep the Speechmatics audio
+            # timeline continuous by sending silence. Words that were in
+            # flight at mute time then finalize *now* (and are dropped as
+            # stale by the bridge) instead of sitting in the server's buffer
+            # and popping out as a phantom turn the moment the mic reopens.
+            silence = InputAudioRawFrame(
+                audio=b"\x00" * len(frame.audio),
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
+            await self.push_frame(silence, FrameDirection.DOWNSTREAM)
 
     def _detect_wakeword(self, frame: InputAudioRawFrame) -> bool:
         samples = self._to_16k_mono(frame)
@@ -199,6 +243,7 @@ class WakeWordGate(FrameProcessor):
         self._state = "LISTENING"
         self._user_speaking = False
         self._cancel_relock()
+        self._cancel_processing_watchdog()
         logger.info(f"🟢 Listening ({reason}) — mic → Speechmatics")
         self._relock_task = asyncio.create_task(self._relock_after(timeout))
 
@@ -212,6 +257,7 @@ class WakeWordGate(FrameProcessor):
     async def _lock(self, reason: str):
         self._state = "LOCKED"
         self._cancel_relock()
+        self._cancel_processing_watchdog()
         self._pending = np.zeros(0, dtype=np.int16)
         self._oww.reset()
         logger.info(f"🔒 Locked ({reason}) — say “{self._wakeword.replace('_', ' ')}” to wake")
@@ -229,6 +275,26 @@ class WakeWordGate(FrameProcessor):
             self._relock_task.cancel()
         self._relock_task = None
 
+    def _start_processing_watchdog(self):
+        self._cancel_processing_watchdog()
+        self._processing_watchdog = asyncio.create_task(self._processing_watchdog_expired())
+
+    async def _processing_watchdog_expired(self):
+        try:
+            await asyncio.sleep(self._processing_timeout)
+            if self._state == "PROCESSING":
+                logger.warning(
+                    f"⚠️  No bot response after {self._processing_timeout:.0f}s — relocking"
+                )
+                await self._lock("no response")
+        except asyncio.CancelledError:
+            pass
+
+    def _cancel_processing_watchdog(self):
+        if self._processing_watchdog and not self._processing_watchdog.done():
+            self._processing_watchdog.cancel()
+        self._processing_watchdog = None
+
     # ---- called by SttGateBridge (downstream of the STT) ----------------------
     def notify_user_started(self):
         """User began speaking — keep the mic open, cancel any relock."""
@@ -239,6 +305,7 @@ class WakeWordGate(FrameProcessor):
         """User finished a sentence — mute the mic while the bot responds."""
         self._user_speaking = False
         self._enter_processing()
+        self._start_processing_watchdog()
 
 
 class SttGateBridge(FrameProcessor):
@@ -246,18 +313,94 @@ class SttGateBridge(FrameProcessor):
 
     UserStarted/Stopped frames only flow downstream, so the gate (which is
     upstream of the STT) can't see them without this bridge.
+
+    It also solves the "stuck words" problem: when the gate mutes the mic
+    mid-sentence (Speechmatics ended the turn at a pause), audio already sent
+    to Speechmatics sits unfinalized in its buffer. When the mic reopens
+    minutes later, new audio flushes that stale segment out as a fresh
+    TranscriptionFrame, which would get sent to the LLM as a phantom turn.
+    So on every end-of-turn we tell the Speechmatics client to finalize its
+    buffer immediately, and we drop any transcription frames that arrive while
+    the gate isn't listening, so the flushed leftovers never reach the context
+    aggregator.
     """
 
-    def __init__(self, gate: WakeWordGate):
+    # The aggregator's turn-stop strategy waits 0.5s after the last final
+    # transcription before triggering the LLM. Finals passed within this grace
+    # window after turn-stop always land before that trigger and get merged
+    # into the turn; anything later would start a phantom turn, so it's dropped.
+    # Keep this <= the strategy timeout (0.5s in pipecat 1.5.0).
+    TRANSCRIPT_GRACE_SECONDS = 0.5
+
+    def __init__(self, gate: WakeWordGate, stt: SpeechmaticsSTTService):
         super().__init__()
         self._gate = gate
+        self._stt = stt
+        self._turn_stopped_at: float | None = None
+        self._saw_final_in_turn = False
+
+    def _flush_stt_buffer(self):
+        """Force Speechmatics to emit (and let us discard) any buffered audio."""
+        client = getattr(self._stt, "_client", None)
+        if client is None:
+            return
+        try:
+            client.finalize()
+        except Exception as e:
+            logger.debug(f"STT buffer flush failed (non-fatal): {e}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, UserStartedSpeakingFrame):
+
+        if isinstance(frame, InterimTranscriptionFrame):
+            # Never forward interims. The aggregator's turn-stop strategy
+            # blocks LLM inference while an interim is "pending" until the
+            # matching final arrives — but finals for audio spoken after the
+            # turn ended get dropped below (they're the phantom turns), which
+            # would leave the strategy waiting forever. Since only finals
+            # carry text into the context, interims are safe to drop always.
+            return
+        elif isinstance(frame, TranscriptionFrame):
+            if self._gate.is_listening:
+                self._saw_final_in_turn = True
+            else:
+                # The STT pushes finals through an internal queue, so a turn's
+                # text can arrive here *after* the UserStoppedSpeaking that
+                # ended it. Only in that case (no final passed yet — the turn
+                # would otherwise be empty and stall) let it through for a
+                # short grace period. If the turn already has its text, any
+                # late final would fire a SECOND LLM inference for the same
+                # turn, so it's dropped.
+                in_grace = (
+                    not self._saw_final_in_turn
+                    and self._turn_stopped_at is not None
+                    and time.monotonic() - self._turn_stopped_at <= self.TRANSCRIPT_GRACE_SECONDS
+                )
+                if not in_grace:
+                    logger.info(f"🗑️ Dropping stale transcription: {frame.text!r}")
+                    return
+                # One late final is the turn's text; close the window so no
+                # second final can trigger a duplicate LLM inference.
+                self._saw_final_in_turn = True
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            if not self._gate.is_listening:
+                return  # phantom turn-start from buffered audio
+            self._saw_final_in_turn = False  # new turn, no text yet
             self._gate.notify_user_started()
         elif isinstance(frame, UserStoppedSpeakingFrame):
+            if not self._gate.is_listening:
+                # End-of-turn for stale buffered audio (gate already muted or
+                # locked). Letting it through would reopen the transcript
+                # grace window and restart the processing watchdog.
+                return
+            self._turn_stopped_at = time.monotonic()
             self._gate.notify_user_stopped()
+            # The gate is muted now: force Speechmatics to finalize any audio
+            # still in its buffer so it can't leak into the next turn. The
+            # resulting stale frames arrive while we're not listening and are
+            # dropped above.
+            self._flush_stt_buffer()
+
         await self.push_frame(frame, direction)
 
 
@@ -272,6 +415,13 @@ class ConversationLogObserver(BaseObserver):
         src, frame = data.source, data.frame
         if isinstance(frame, TranscriptionFrame) and isinstance(src, STTService):
             logger.info(f"🧑 You: {frame.text}")
+        elif isinstance(frame, LLMContextFrame) and not isinstance(src, LLMService):
+            # The user aggregator pushing context = one LLM inference firing.
+            # Exactly one of these per spoken turn is healthy; two means a
+            # duplicate trigger; zero means the turn was lost upstream.
+            logger.info("🧠 LLM inference triggered")
+        elif isinstance(frame, ErrorFrame):
+            logger.error(f"❌ Pipeline error from {src}: {frame.error}")
         elif isinstance(frame, LLMTextFrame) and isinstance(src, LLMService):
             self._reply += frame.text  # LLM streams tokens; buffer them
         elif isinstance(frame, LLMFullResponseEndFrame) and isinstance(src, LLMService):
@@ -376,7 +526,7 @@ async def main():
     wakeword = os.getenv("WAKE_WORD", "hey_jarvis")
     wake_threshold = float(os.getenv("WAKE_THRESHOLD", "0.5"))
     wake_listen_seconds = float(os.getenv("WAKE_LISTEN_SECONDS", "8"))
-    followup_seconds = float(os.getenv("FOLLOWUP_SECONDS", "3"))
+    followup_seconds = float(os.getenv("FOLLOWUP_SECONDS", "5"))
 
     # Lity: our custom OpenAI-compatible LLM backend (turns + proactive pushes).
     lity_base_url = os.getenv("LITY_BASE_URL", "http://localhost:8321/v1").rstrip("/")
@@ -409,16 +559,23 @@ async def main():
         wake_listen_seconds=wake_listen_seconds,
         followup_seconds=followup_seconds,
     )
-    stt_bridge = SttGateBridge(gate)
-
     # --- Speech-to-text: Speechmatics (server-side turn detection) -------------
     stt = SpeechmaticsSTTService(
         api_key=speechmatics_key,
         settings=SpeechmaticsSTTService.Settings(
             language=Language.EN,
             turn_detection_mode=SpeechmaticsSTTService.TurnDetectionMode.ADAPTIVE,
+            # Max pause that still counts as "thinking" rather than "done"
+            # (seconds). ADAPTIVE mode ends the turn sooner when the sentence
+            # sounds complete, so a high value here mostly costs latency only
+            # when you trail off mid-thought. Lower = snappier, but breathing
+            # pauses may cut you off.
+            end_of_utterance_silence_trigger=float(
+                os.getenv("EOU_SILENCE_TRIGGER", "1.5")
+            ),
         ),
     )
+    stt_bridge = SttGateBridge(gate, stt)
 
     # --- LLM: Lity (OpenAI-compatible). Reads only the last user message and
     #     owns conversation memory server-side, so we send no system prompt or
