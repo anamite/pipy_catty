@@ -1,5 +1,8 @@
 pipecat-ai[speechmatics,openai,silero,local]
 python-dotenv
-openwakeword==0.6.0
 soxr
 httpx
+
+# openwakeword is installed separately by install.sh: it hard-requires
+# tflite-runtime on Linux, which has no wheel for many Pi Python builds, even
+# though we only use its ONNX backend. See install.sh for the workaround.

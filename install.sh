@@ -84,6 +84,20 @@ echo "==> Upgrading pip, setuptools, wheel..."
 echo "==> Installing requirements..."
 "$VENV_PY" -m pip install -r requirements.txt
 
+echo "==> Installing openwakeword..."
+# openwakeword hard-requires tflite-runtime on Linux (platform_system ==
+# "Linux" marker), but tflite-runtime has no wheel for many Pi Python
+# builds (e.g. Python 3.13 on aarch64), which fails the whole install even
+# though we only ever use openwakeword's ONNX backend. Install its actual
+# runtime deps ourselves and pull in openwakeword with --no-deps to skip
+# the unneeded, unavailable tflite-runtime requirement. Harmless on
+# Windows too, since the "full" install works there but this path also
+# reaches the exact same result.
+"$VENV_PY" -m pip install \
+    "onnxruntime<2,>=1.10.0" "tqdm<5.0,>=4.0" "scipy<2,>=1.3" \
+    "scikit-learn<2,>=1" "requests<3,>=2.0"
+"$VENV_PY" -m pip install --no-deps openwakeword==0.6.0
+
 echo "==> Preparing .env..."
 if [ ! -f .env ]; then
     cp .env.example .env
