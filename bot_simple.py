@@ -47,11 +47,18 @@ AUDIO_INPUT_DEVICE_INDEX, AUDIO_OUTPUT_DEVICE_INDEX.
 
 import argparse
 import asyncio
+import io
 import logging
+import math
 import os
+import queue
+import struct
 import sys
+import threading
 import time
+import wave
 import warnings
+from dataclasses import dataclass
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 logging.getLogger("openwakeword").setLevel(logging.ERROR)
@@ -72,6 +79,7 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMTextFrame,
+    SystemFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -104,6 +112,19 @@ logger.add(sys.stderr, level="INFO")
 # openWakeWord expects 16 kHz mono int16 audio, processed in 80 ms chunks.
 OWW_SAMPLE_RATE = 16000
 OWW_CHUNK = 1280  # samples (80 ms @ 16 kHz)
+
+
+@dataclass
+class MicStateFrame(SystemFrame):
+    """Marker frame: the gate's mic just opened or closed.
+
+    Carries no audio and needs no handling from any real processor — it
+    exists purely so :class:`TonePlayerObserver` can react to it. SystemFrame
+    means it's processed immediately, ahead of any queued data frames, so the
+    beep timing matches the actual state change.
+    """
+
+    listening: bool
 
 
 def _ensure_wakeword_models(wakeword: str):
@@ -233,6 +254,7 @@ class WakeWordGate(FrameProcessor):
         self._cancel_watchdog()
         self._relock_task = asyncio.create_task(self._relock_timer(relock_after))
         logger.info(f"🟢 Open ({reason}) — mic → Speechmatics")
+        self._notify_mic_state(listening=True)
 
     def _mute(self, reason: str):
         if self._state == "MUTED":
@@ -240,6 +262,7 @@ class WakeWordGate(FrameProcessor):
         self._state = "MUTED"
         self._cancel_relock()
         logger.info(f"🔇 Muted ({reason}) — bot's turn")
+        self._notify_mic_state(listening=False)
 
     def _lock(self, reason: str):
         self._state = "LOCKED"
@@ -249,6 +272,20 @@ class WakeWordGate(FrameProcessor):
         self._oww.reset()
         spoken = self._wakeword.replace("_", " ")
         logger.info(f"🔒 Locked ({reason}) — say “{spoken}” to wake")
+        self._notify_mic_state(listening=False)
+
+    def _notify_mic_state(self, listening: bool):
+        """Tell TonePlayerObserver the mic just flipped — fire and forget.
+
+        Scheduled as a background task rather than awaited here, so this
+        never adds latency to (or can fail) the gate's own state handling.
+        The marker frame itself is pushed through the normal pipeline; only
+        the resulting beep happens on a fully separate audio stream/thread
+        (see TonePlayerObserver), never touching the mic/speaker pipeline.
+        """
+        asyncio.create_task(
+            self.push_frame(MicStateFrame(listening=listening), FrameDirection.DOWNSTREAM)
+        )
 
     # ---- called by SttGateBridge ---------------------------------------------
     def notify_user_started(self):
@@ -350,6 +387,85 @@ class SttGateBridge(FrameProcessor):
             self._gate.notify_user_stopped()
 
         await self.push_frame(frame, direction)
+
+
+def _make_beep_wav(frequency: float, duration: float, sample_rate: int = 44100) -> bytes:
+    """Synthesize a short sine-wave beep as an in-memory mono 16-bit WAV.
+
+    A few milliseconds of fade in/out avoid the audible "click" a sine wave
+    makes if it starts/stops at a nonzero amplitude.
+    """
+    n_samples = int(sample_rate * duration)
+    fade_samples = int(sample_rate * 0.005)  # 5 ms fade
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)  # 16-bit
+        wav.setframerate(sample_rate)
+        for i in range(n_samples):
+            fade = min(1.0, i / fade_samples, (n_samples - i) / fade_samples)
+            value = 0.3 * fade * math.sin(2 * math.pi * frequency * i / sample_rate)
+            wav.writeframes(struct.pack("<h", int(value * 32767)))
+    return buf.getvalue()
+
+
+class TonePlayerObserver(BaseObserver):
+    """Plays a short beep whenever the mic opens or closes.
+
+    A simple audio status indicator for headless setups (e.g. a Pi with no
+    screen) where you can't watch the 🟢/🔇 log lines: high beep = mic is
+    now listening, low beep = mic just muted/locked.
+
+    This runs entirely on its OWN PyAudio stream and its own background
+    thread. It only *reacts* to MicStateFrame markers the gate pushes — it
+    never touches transport.output() or any frame in the real pipeline, so
+    beep playback can never add latency to, or interfere with, the actual
+    mic/speaker audio path.
+    """
+
+    LISTENING_BEEP = _make_beep_wav(frequency=880, duration=0.12)  # high: mic on
+    MUTED_BEEP = _make_beep_wav(frequency=440, duration=0.12)  # low: mic off
+
+    def __init__(self, output_device_index: int | None = None):
+        super().__init__()
+        self._device_index = output_device_index
+        self._queue: queue.Queue[bytes] = queue.Queue()
+        self._pa = None  # created lazily, on the worker thread
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    async def on_push_frame(self, data: FramePushed):
+        # Observers see every frame at every pipeline hop. Only react to the
+        # gate's original MicStateFrame emission, otherwise one state change
+        # can beep multiple times as the marker propagates downstream.
+        if isinstance(data.frame, MicStateFrame) and isinstance(data.source, WakeWordGate):
+            beep = self.LISTENING_BEEP if data.frame.listening else self.MUTED_BEEP
+            self._queue.put_nowait(beep)  # non-blocking hand-off to the worker thread
+
+    def _worker(self):
+        import pyaudio
+
+        self._pa = pyaudio.PyAudio()
+        while True:
+            wav_bytes = self._queue.get()
+            try:
+                self._play(wav_bytes)
+            except Exception as e:
+                logger.debug(f"Tone playback failed (non-fatal): {e}")
+
+    def _play(self, wav_bytes: bytes):
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+            stream = self._pa.open(
+                format=self._pa.get_format_from_width(wav.getsampwidth()),
+                channels=wav.getnchannels(),
+                rate=wav.getframerate(),
+                output=True,
+                output_device_index=self._device_index,
+            )
+            try:
+                stream.write(wav.readframes(wav.getnframes()))
+            finally:
+                stream.stop_stream()
+                stream.close()
 
 
 class TranscriptLogObserver(BaseObserver):
@@ -488,7 +604,10 @@ async def main():
     task = PipelineTask(
         pipeline,
         params=PipelineParams(enable_metrics=True),
-        observers=[TranscriptLogObserver()],
+        observers=[
+            TranscriptLogObserver(),
+            TonePlayerObserver(output_device_index=_env_int("AUDIO_OUTPUT_DEVICE_INDEX")),
+        ],
         # We can sit LOCKED (no BotSpeaking/UserSpeaking frames) for long
         # stretches waiting for the wake word — that's normal, not a stuck
         # pipeline, so disable the idle-cancel watchdog entirely.
