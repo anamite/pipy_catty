@@ -51,7 +51,7 @@ cmd_start() {
     fi
 
     echo "Starting pipy voice bot..."
-    "$VENV_PY" -u bot.py >>"$LOG_FILE" 2>&1 &
+    "$VENV_PY" -u bot_simple.py >>"$LOG_FILE" 2>&1 &
     local bash_pid=$!
     disown "$bash_pid" 2>/dev/null || true
 
@@ -130,7 +130,7 @@ cmd_devices() {
         echo "Virtual environment not found. Run ./install.sh first." >&2
         return 1
     fi
-    "$VENV_PY" bot.py --list-devices
+    "$VENV_PY" bot_simple.py --list-devices
 }
 
 case "${1:-}" in

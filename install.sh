@@ -15,11 +15,13 @@ case "$OS_KIND" in
         echo "==> Installing system packages (requires sudo)..."
         # portaudio19-dev: PyAudio needs PortAudio headers to build.
         # build-essential: compilers for PyAudio and any other sdist builds.
-        # libatlas-base-dev: common runtime dep for numpy/scipy on ARM.
+        # (libatlas-base-dev used to be needed for numpy/scipy on ARM, but it
+        # no longer exists as a package on Debian trixie/Pi OS bookworm+ —
+        # current numpy wheels for aarch64 bundle OpenBLAS, so it's dropped.)
         sudo apt-get update
         sudo apt-get install -y \
             python3 python3-venv python3-pip \
-            portaudio19-dev libatlas-base-dev build-essential
+            portaudio19-dev build-essential
 
         PYTHON_BIN="python3"
         VENV_PY="$VENV_DIR/bin/python"
