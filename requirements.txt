@@ -1,5 +1,5 @@
 pipecat-ai[speechmatics,openai,silero,local]
 python-dotenv
-openwakeword
+openwakeword==0.6.0
 soxr
 httpx
