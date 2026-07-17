@@ -1,4 +1,4 @@
-pipecat-ai[speechmatics,openai,silero,local]
+pipecat-ai[speechmatics,openai,silero,local,kokoro]
 python-dotenv
 soxr
 httpx

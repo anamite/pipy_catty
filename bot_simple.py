@@ -95,7 +95,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.openai.tts import OpenAITTSService
+# from pipecat.services.openai.tts import OpenAITTSService
+from pipecat.services.kokoro import KokoroTTSService
 from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
@@ -528,12 +529,9 @@ def list_audio_devices():
 
 
 async def main():
-    openai_key = os.getenv("OPENAI_API_KEY")
     speechmatics_key = os.getenv("SPEECHMATICS_API_KEY")
-    if not openai_key or not speechmatics_key:
-        raise RuntimeError(
-            "Missing API keys. Set OPENAI_API_KEY and SPEECHMATICS_API_KEY in .env"
-        )
+    if not speechmatics_key:
+        raise RuntimeError("Missing API key. Set SPEECHMATICS_API_KEY in .env")
 
     lity_base_url = os.getenv("LITY_BASE_URL", "http://localhost:8321/v1").rstrip("/")
     lity_api_key = os.getenv("LITY_API_KEY", "")
@@ -574,11 +572,23 @@ async def main():
         settings=OpenAILLMService.Settings(model=lity_model),
     )
 
-    tts = OpenAITTSService(
-        api_key=openai_key,
-        settings=OpenAITTSService.Settings(
-            model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
-            voice=os.getenv("OPENAI_VOICE_ID", "alloy"),
+    # tts = OpenAITTSService(
+    #     api_key=os.getenv("OPENAI_API_KEY"),
+    #     settings=OpenAITTSService.Settings(
+    #         model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
+    #         voice=os.getenv("OPENAI_VOICE_ID", "alloy"),
+    #     ),
+    # )
+
+    # Local Kokoro TTS (ONNX, no API key). Model files auto-download to
+    # ~/.cache/pipecat/kokoro-onnx/ unless KOKORO_MODEL_PATH/KOKORO_VOICES_PATH
+    # point at an existing install.
+    tts = KokoroTTSService(
+        model_path=os.getenv("KOKORO_MODEL_PATH"),
+        voices_path=os.getenv("KOKORO_VOICES_PATH"),
+        settings=KokoroTTSService.Settings(
+            voice=os.getenv("KOKORO_VOICE_ID", "af_heart"),
+            language=Language.EN,
         ),
     )
 
